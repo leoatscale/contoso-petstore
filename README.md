@@ -43,3 +43,5 @@ chmod +x scripts/setup-azure.sh
 | GET | `/api/health/live` | Liveness probe |
 | GET | `/api/health/ready` | Readiness probe |
 | GET | `/swagger` | Swagger UI |
+
+<!-- first deploy -->
