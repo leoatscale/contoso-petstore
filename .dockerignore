@@ -1,0 +1,10 @@
+**/.git
+**/.vs
+**/bin
+**/obj
+**/node_modules
+**/.idea
+*.md
+.github/
+k8s/
+scripts/

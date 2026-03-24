@@ -1,0 +1,339 @@
+# =============================================================================
+# Contoso Pet Store - CI/CD Pipeline
+# GitHub Actions + GHAS + ACR + AKS + SRE Auto-Rollback
+# =============================================================================
+
+name: "🚀 Build, Scan & Deploy"
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'terraform/**'
+      - '**.md'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'terraform/**'
+      - '**.md'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  packages: write
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  AKS_CLUSTER: ${{ vars.AKS_CLUSTER }}
+  AKS_RESOURCE_GROUP: ${{ vars.AKS_RG }}
+  IMAGE_NAME: contoso-petstore
+  APPINSIGHTS_APP_ID: ${{ vars.APPINSIGHTS_APP_ID }}
+
+jobs:
+
+  # ===========================================================================
+  # Job 1: Code Quality & Security Analysis (GHAS)
+  # ===========================================================================
+  security-scan:
+    name: "🔒 GHAS Security Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: csharp
+          queries: security-extended
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:csharp"
+
+  # ===========================================================================
+  # Job 2: Build, Test & Push Container Image
+  # ===========================================================================
+  build-and-push:
+    name: "🏗️ Build & Push to ACR"
+    runs-on: ubuntu-latest
+    needs: security-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      previous-tag: ${{ steps.previous.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      # -----------------------------------------------------------------------
+      # Save current "latest" tag as rollback target BEFORE pushing new image
+      # -----------------------------------------------------------------------
+      - name: Get previous image tag (rollback target)
+        id: previous
+        run: |
+          PREV_TAG=$(az acr repository show-tags \
+            --name ${{ env.ACR_NAME }} \
+            --repository ${{ env.IMAGE_NAME }} \
+            --orderby time_desc \
+            --top 2 \
+            --query "[?@ != 'latest'] | [0]" \
+            -o tsv 2>/dev/null || echo "none")
+          echo "tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          echo "📦 Previous image tag (rollback target): $PREV_TAG"
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          VERSION=$(date +%Y%m%d)-${GITHUB_SHA::7}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "🏷️ Image tag: $VERSION"
+
+      - name: Build & Push container image
+        run: |
+          docker build \
+            --tag ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }} \
+            --tag ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest \
+            --build-arg APP_VERSION=${{ steps.meta.outputs.version }} \
+            .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload Trivy scan to GHAS
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: "container-scanning"
+
+  # ===========================================================================
+  # Job 3: Deploy to AKS
+  # ===========================================================================
+  deploy:
+    name: "🚀 Deploy to AKS"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+
+    outputs:
+      service-ip: ${{ steps.get-ip.outputs.ip }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER }} \
+            --overwrite-existing
+
+      - name: Deploy to AKS
+        run: |
+          export IMAGE_TAG=${{ needs.build-and-push.outputs.image-tag }}
+          export ACR_NAME=${{ env.ACR_NAME }}
+          envsubst < k8s/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/petstore-api -n petstore --timeout=300s
+          echo "✅ Deployment rollout complete"
+
+      - name: Get service IP
+        id: get-ip
+        run: |
+          for i in $(seq 1 30); do
+            IP=$(kubectl get svc petstore-api -n petstore \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+            if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+              echo "ip=$IP" >> $GITHUB_OUTPUT
+              echo "🌐 Service IP: $IP"
+              exit 0
+            fi
+            echo "Waiting for external IP... ($i/30)"
+            sleep 10
+          done
+          echo "⚠️ Could not get external IP, continuing anyway"
+          echo "ip=" >> $GITHUB_OUTPUT
+
+  # ===========================================================================
+  # Job 4: SRE Health Validation + Auto-Rollback
+  # ===========================================================================
+  sre-validation:
+    name: "🩺 SRE Health Check"
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy]
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER }} \
+            --overwrite-existing
+
+      # -----------------------------------------------------------------------
+      # Step 1: Generate load to produce fresh telemetry
+      # -----------------------------------------------------------------------
+      - name: "🔥 Generate test load (30s)"
+        run: |
+          SERVICE_IP="${{ needs.deploy.outputs.service-ip }}"
+          if [ -z "$SERVICE_IP" ]; then
+            echo "⚠️ No service IP, skipping load test"
+            exit 0
+          fi
+
+          echo "Generating load against http://$SERVICE_IP ..."
+
+          # Install hey (lightweight HTTP load generator)
+          wget -q https://hey-release.s3.us-east-2.amazonaws.com/hey_linux_amd64 -O hey
+          chmod +x hey
+
+          # 30 seconds, 10 concurrent connections, ~5 req/sec each
+          ./hey -z 30s -c 10 -q 5 "http://$SERVICE_IP/api/pets" | tee load_results.txt
+
+          echo ""
+          echo "📊 Load test complete. Summary:"
+          grep -A5 "Summary:" load_results.txt || tail -20 load_results.txt
+
+      # -----------------------------------------------------------------------
+      # Step 2: Wait for App Insights to ingest telemetry
+      # -----------------------------------------------------------------------
+      - name: "⏳ Wait for telemetry (30s)"
+        run: sleep 30
+
+      # -----------------------------------------------------------------------
+      # Step 3: Query App Insights metrics
+      # -----------------------------------------------------------------------
+      - name: "📊 Check health metrics"
+        id: health
+        run: |
+          echo "Querying Application Insights..."
+
+          APP_ID="${{ env.APPINSIGHTS_APP_ID }}"
+
+          # Use Azure CLI token to query App Insights REST API
+          TOKEN=$(az account get-access-token \
+            --resource https://api.applicationinsights.io \
+            --query accessToken -o tsv)
+
+          QUERY='requests | where timestamp > ago(5m) | summarize avg_duration=avg(duration), error_rate=todouble(countif(success == false)) / todouble(count()) * 100, total=count()'
+
+          RESPONSE=$(curl -s \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.applicationinsights.io/v1/apps/$APP_ID/query" \
+            -d "{\"query\": \"$QUERY\"}")
+
+          echo "$RESPONSE" | jq .
+
+          AVG_LATENCY=$(echo "$RESPONSE" | jq -r '.tables[0].rows[0][0] // 0')
+          ERROR_RATE=$(echo "$RESPONSE" | jq -r '.tables[0].rows[0][1] // 0')
+          TOTAL=$(echo "$RESPONSE" | jq -r '.tables[0].rows[0][2] // 0')
+
+          echo ""
+          echo "============================================"
+          echo "  📊 Health Metrics (last 5 min)"
+          echo "============================================"
+          echo "  Avg Latency:    ${AVG_LATENCY}ms (max: 500ms)"
+          echo "  Error Rate:     ${ERROR_RATE}% (max: 5%)"
+          echo "  Total Requests: ${TOTAL}"
+          echo "============================================"
+
+          NEEDS_ROLLBACK="false"
+
+          if [ "$(echo "$AVG_LATENCY > 500" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+            echo "❌ LATENCY EXCEEDED"
+            NEEDS_ROLLBACK="true"
+          fi
+
+          if [ "$(echo "$ERROR_RATE > 5" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+            echo "❌ ERROR RATE EXCEEDED"
+            NEEDS_ROLLBACK="true"
+          fi
+
+          echo "needs_rollback=$NEEDS_ROLLBACK" >> $GITHUB_OUTPUT
+          echo "avg_latency=$AVG_LATENCY" >> $GITHUB_OUTPUT
+          echo "error_rate=$ERROR_RATE" >> $GITHUB_OUTPUT
+
+      # -----------------------------------------------------------------------
+      # Step 4: Auto-Rollback
+      # -----------------------------------------------------------------------
+      - name: "🔄 AUTO-ROLLBACK"
+        if: steps.health.outputs.needs_rollback == 'true'
+        run: |
+          PREV="${{ needs.build-and-push.outputs.previous-tag }}"
+
+          echo "🚨 ROLLBACK TRIGGERED"
+          echo "   Latency:    ${{ steps.health.outputs.avg_latency }}ms"
+          echo "   Error Rate: ${{ steps.health.outputs.error_rate }}%"
+          echo "   Target:     $PREV"
+
+          if [ "$PREV" = "none" ] || [ -z "$PREV" ]; then
+            echo "❌ No previous version! Manual intervention needed."
+            exit 1
+          fi
+
+          kubectl set image deployment/petstore-api \
+            petstore-api=${{ env.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:$PREV \
+            -n petstore
+
+          kubectl rollout status deployment/petstore-api -n petstore --timeout=300s
+          echo "✅ Rolled back to $PREV"
+
+          # Mark pipeline as failed so team investigates
+          exit 1
+
+      - name: "✅ Deployment healthy"
+        if: steps.health.outputs.needs_rollback != 'true'
+        run: |
+          echo "✅ HEALTHY"
+          echo "   Latency:    ${{ steps.health.outputs.avg_latency }}ms"
+          echo "   Error Rate: ${{ steps.health.outputs.error_rate }}%"
+          echo "   Image:      ${{ needs.build-and-push.outputs.image-tag }}"

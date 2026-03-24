@@ -1,0 +1,21 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+.vs/
+
+## IDE
+.idea/
+.vscode/
+*.swp
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Secrets (never commit!)
+appsettings.Development.json
+*.pfx
+*.key

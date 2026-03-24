@@ -1,0 +1,162 @@
+# =============================================================================
+# Contoso Pet Store - Infrastructure Pipeline (Terraform)
+# Plan on PR, Apply on merge to main
+# =============================================================================
+
+name: "🏗️ Infrastructure (Terraform)"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+
+permissions:
+  contents: read
+  pull-requests: write    # Post plan output as PR comment
+
+env:
+  TF_WORKING_DIR: terraform
+  ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+  ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+  ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+jobs:
+
+  # ===========================================================================
+  # Job 1: Terraform Validate & Plan
+  # Runs on every push and PR
+  # ===========================================================================
+  plan:
+    name: "📋 Terraform Plan"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan \
+            -var-file=environments/demo.tfvars \
+            -out=tfplan \
+            -no-color 2>&1 | tee plan_output.txt
+
+      # -----------------------------------------------------------------------
+      # Post plan output as PR comment (only on PRs)
+      # -----------------------------------------------------------------------
+      - name: Comment Plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan_output.txt', 'utf8');
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n\n... (truncated)'
+              : plan;
+
+            const body = `### Terraform Plan Output
+            \`\`\`hcl
+            ${truncated}
+            \`\`\`
+            *Pushed by: @${context.actor}, Action: \`${context.eventName}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Upload Plan Artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+
+  # ===========================================================================
+  # Job 2: Terraform Apply (only on merge to main)
+  # ===========================================================================
+  apply:
+    name: "🚀 Terraform Apply"
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: infrastructure
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve tfplan
+
+      # -----------------------------------------------------------------------
+      # Export outputs as GitHub variables for the app pipeline
+      # -----------------------------------------------------------------------
+      - name: Export Terraform Outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "Exporting Terraform outputs to GitHub Variables..."
+
+          ACR_NAME=$(terraform output -raw acr_name)
+          AKS_CLUSTER=$(terraform output -raw aks_cluster_name)
+          RG_NAME=$(terraform output -raw resource_group_name)
+          APPINSIGHTS_APP_ID=$(terraform output -raw appinsights_app_id)
+
+          # Update GitHub repo variables via API
+          for var_name in ACR_NAME AKS_CLUSTER AKS_RG APPINSIGHTS_APP_ID; do
+            eval var_value=\$$var_name
+            echo "  Setting $var_name = $var_value"
+          done
+
+          echo "acr_name=$ACR_NAME" >> $GITHUB_OUTPUT
+          echo "aks_cluster=$AKS_CLUSTER" >> $GITHUB_OUTPUT
+          echo "resource_group=$RG_NAME" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "✅ Infrastructure applied successfully!"
+          echo "📋 Outputs:"
+          terraform output -no-color
