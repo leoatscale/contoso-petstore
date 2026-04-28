@@ -25,9 +25,10 @@ public class DemoVulnerabilitiesController : ControllerBase
     {
         var connectionString = "Server=localhost;Database=pets;";
         using var connection = new SqlConnection(connectionString);
-        // BAD: Direct string concatenation in SQL query
-        var query = "SELECT * FROM Pets WHERE Name = '" + name + "'";
+        // FIXED: Use parameterized SQL query to prevent injection
+        var query = "SELECT * FROM Pets WHERE Name = @name";
         using var command = new SqlCommand(query, connection);
+        command.Parameters.AddWithValue("@name", name ?? string.Empty);
         return Ok("This endpoint has a SQL injection vulnerability");
     }
 
