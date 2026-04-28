@@ -6,6 +6,7 @@
 
 using Microsoft.AspNetCore.Mvc;
 using System.Data.SqlClient;
+using System.IO;
 
 namespace ContosoPetStore.Controllers;
 
@@ -47,8 +48,28 @@ public class DemoVulnerabilitiesController : ControllerBase
     [HttpGet("file")]
     public ActionResult ReadFile([FromQuery] string filename)
     {
-        // BAD: User input directly in file path
-        var content = System.IO.File.ReadAllText("/data/" + filename);
+        if (string.IsNullOrWhiteSpace(filename) ||
+            filename.Contains("..") ||
+            filename.Contains('/') ||
+            filename.Contains('\\'))
+        {
+            return BadRequest("Invalid filename");
+        }
+
+        var basePath = Path.GetFullPath("/data");
+        var fullPath = Path.GetFullPath(Path.Combine(basePath, filename));
+
+        if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            return BadRequest("Invalid filename");
+        }
+
+        if (!System.IO.File.Exists(fullPath))
+        {
+            return NotFound();
+        }
+
+        var content = System.IO.File.ReadAllText(fullPath);
         return Ok(content);
     }
 
