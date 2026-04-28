@@ -59,7 +59,7 @@ public class DemoVulnerabilitiesController : ControllerBase
         var basePath = Path.GetFullPath("/data");
         var fullPath = Path.GetFullPath(Path.Combine(basePath, filename));
 
-        if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && fullPath != basePath)
+        if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar, StringComparison.Ordinal))
         {
             return BadRequest("Invalid filename");
         }
