@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 
 namespace ContosoPetStore.Middleware;
 
@@ -13,6 +14,16 @@ public class RequestLoggingMiddleware
         _logger = logger;
     }
 
+    private static string SanitizeForLog(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return string.Empty;
+        }
+
+        return new string(value.Where(c => !char.IsControl(c)).ToArray());
+    }
+
     public async Task InvokeAsync(HttpContext context)
     {
         var stopwatch = Stopwatch.StartNew();
@@ -24,10 +35,13 @@ public class RequestLoggingMiddleware
         finally
         {
             stopwatch.Stop();
+            var method = SanitizeForLog(context.Request.Method);
+            var path = SanitizeForLog(context.Request.Path.Value);
+
             _logger.LogInformation(
                 "HTTP {Method} {Path} responded {StatusCode} in {ElapsedMs}ms",
-                context.Request.Method,
-                context.Request.Path,
+                method,
+                path,
                 context.Response.StatusCode,
                 stopwatch.ElapsedMilliseconds);
         }
