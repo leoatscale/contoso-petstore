@@ -23,7 +23,7 @@ public class DemoVulnerabilitiesController : ControllerBase
     [HttpGet("search-unsafe")]
     public ActionResult UnsafeSearch([FromQuery] string name)
     {
-        var connectionString = "Server=localhost;Database=pets;";
+        var connectionString = "Server=localhost;Database=pets;Encrypt=True;";
         using var connection = new SqlConnection(connectionString);
         // BAD: Direct string concatenation in SQL query
         var query = "SELECT * FROM Pets WHERE Name = '" + name + "'";
